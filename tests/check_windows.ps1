@@ -14,7 +14,11 @@ if ((Canonical $a) -ne (Canonical $b)) { throw 'State JSON round-trip changed ca
 $b.Logs.Security.Size=65536
 if ((Canonical $a) -eq (Canonical $b)) { throw 'State drift not detected' }
 # NetSecurity GpoBoolean is an enum, not a bool. Snapshot must normalize to stable strings.
-enum TestGpoBoolean { NotConfigured=0; True=1; False=2 }
+enum TestGpoBoolean {
+    NotConfigured = 0
+    True = 1
+    False = 2
+}
 function Get-NetFirewallProfile {
     [pscustomobject]@{Name='Public';LogBlocked=[TestGpoBoolean]::True;LogAllowed=[TestGpoBoolean]::True;LogMaxSizeKilobytes=32767}
 }
