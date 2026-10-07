@@ -31,7 +31,7 @@ function Native([string]$File, [string[]]$Arguments) {
 }
 function Save-State($State) {
     $temporary = Join-Path $StateDirectory 'state.tmp'
-    $State | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Normalize $State | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $temporary -Encoding UTF8
     Move-Item -LiteralPath $temporary -Destination (Join-Path $StateDirectory 'state.json') -Force
 }
 function Protect-Directory([string]$Path) {
@@ -59,7 +59,9 @@ function Snapshot {
     $temporary=Join-Path $env:TEMP (('awsec2config-' + [guid]::NewGuid().ToString()) + '.csv')
     try {
         $null=Native 'auditpol.exe' @('/backup',"/file:$temporary")
-        $backup=Get-Content -LiteralPath $temporary -Raw
+        # Windows PowerShell 5.1 serializes Get-Content's provider metadata recursively.
+        # Read a plain .NET string to keep both backups and state JSON bounded.
+        $backup=[IO.File]::ReadAllText($temporary)
     } finally { Remove-Item -LiteralPath $temporary -ErrorAction SilentlyContinue }
     return @{ Logs=$logs; Firewall=$fw; Registry=(Read-Registry); Audit=(Native 'auditpol.exe' @('/get','/category:*','/r')); AuditBackup=$backup }
 }
