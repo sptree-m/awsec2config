@@ -73,7 +73,7 @@ function Normalize($Value) {
         foreach ($key in @($Value.Keys | Sort-Object)) { $sorted[$key]=Normalize $Value[$key] }
         return $sorted
     }
-    if ($Value -is [pscustomobject]) {
+    if ($Value.GetType() -eq [System.Management.Automation.PSCustomObject]) {
         $sorted=[ordered]@{}
         foreach ($p in @($Value.PSObject.Properties | Sort-Object Name)) { $sorted[$p.Name]=Normalize $p.Value }
         return $sorted
