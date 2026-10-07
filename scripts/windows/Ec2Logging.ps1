@@ -63,22 +63,23 @@ function Snapshot {
     } finally { Remove-Item -LiteralPath $temporary -ErrorAction SilentlyContinue }
     return @{ Logs=$logs; Firewall=$fw; Registry=(Read-Registry); Audit=(Native 'auditpol.exe' @('/get','/category:*','/r')); AuditBackup=$backup }
 }
-function Normalize($Value) {
+function Normalize($Value, [int]$Depth=0) {
+    if ($Depth -gt 12) { throw 'Unexpected recursive state value; comparison stopped' }
     if ($null -eq $Value) { return $null }
     # Get-Content annotates strings with ETS properties; serialize their scalar value.
     if ($Value -is [string]) { return [string]::new($Value.ToCharArray()) }
     if ($Value.GetType().IsValueType) { return $Value }
     if ($Value -is [System.Collections.IDictionary]) {
         $sorted=[ordered]@{}
-        foreach ($key in @($Value.Keys | Sort-Object)) { $sorted[$key]=Normalize $Value[$key] }
+        foreach ($key in @($Value.Keys | Sort-Object)) { $sorted[$key]=Normalize $Value[$key] ($Depth + 1) }
         return $sorted
     }
     if ($Value.GetType() -eq [System.Management.Automation.PSCustomObject]) {
         $sorted=[ordered]@{}
-        foreach ($p in @($Value.PSObject.Properties | Sort-Object Name)) { $sorted[$p.Name]=Normalize $p.Value }
+        foreach ($p in @($Value.PSObject.Properties | Sort-Object Name)) { $sorted[$p.Name]=Normalize $p.Value ($Depth + 1) }
         return $sorted
     }
-    if ($Value -is [array]) { return ,@($Value | ForEach-Object { Normalize $_ }) }
+    if ($Value -is [array]) { return ,@($Value | ForEach-Object { Normalize $_ ($Depth + 1) }) }
     return $Value
 }
 function Canonical($Value) { return (Normalize $Value | ConvertTo-Json -Depth 15 -Compress) }
