@@ -16,6 +16,7 @@ jobs:
       - run: python -m compileall -q scripts tests
   powershell:
     runs-on: windows-latest
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
       - name: Windows PowerShell 5.1 parser and state helpers

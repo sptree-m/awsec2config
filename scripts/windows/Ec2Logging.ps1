@@ -66,7 +66,7 @@ function Snapshot {
 function Normalize($Value) {
     if ($null -eq $Value) { return $null }
     # Get-Content annotates strings with ETS properties; serialize their scalar value.
-    if ($Value -is [string]) { return $Value.ToString() }
+    if ($Value -is [string]) { return [string]::new($Value.ToCharArray()) }
     if ($Value.GetType().IsValueType) { return $Value }
     if ($Value -is [System.Collections.IDictionary]) {
         $sorted=[ordered]@{}

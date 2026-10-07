@@ -8,6 +8,7 @@ foreach ($name in @('Normalize','Canonical','Snapshot','Audit-Enabled')) {
     $node=$ast.Find({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true)
     Invoke-Expression $node.Extent.Text
 }
+Write-Output "Checking canonical state round-trip"
 $a=@{ Logs=@{ Security=@{Enabled=$true;Size=268435456} }; Registry=@{Exists=$true;Value=1;Kind='DWord'} }
 $b=$a | ConvertTo-Json -Depth 15 | ConvertFrom-Json
 if ((Canonical $a) -ne (Canonical $b)) { throw 'State JSON round-trip changed canonical values' }
@@ -32,9 +33,11 @@ function Native($File,$Arguments) {
 }
 $Channels=@('Security','System','Microsoft-Windows-PowerShell/Operational')
 if (-not $env:TEMP) { $env:TEMP=[IO.Path]::GetTempPath() }
+Write-Output "Checking snapshot round-trip"
 $snapshot=Snapshot
 if ($snapshot.Firewall[0].LogBlocked -cne 'True') { throw 'Firewall enum normalization failed' }
 if ((Canonical $snapshot) -ne (Canonical ($snapshot | ConvertTo-Json -Depth 15 | ConvertFrom-Json))) { throw 'Full snapshot round-trip failed' }
+Write-Output "Checking audit setting values"
 $Subcategories=@('{0CCE9215-69AE-11D9-BED3-505054503030}')
 $header='Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting,Setting Value'
 $enabled=$header + "`n" + ('HOST,System,Logon,' + $Subcategories[0] + ',Success and Failure,,3')
