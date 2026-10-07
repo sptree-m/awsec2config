@@ -98,7 +98,7 @@ def collect(args):
         data = query('log-groups', ['logs', 'describe-log-groups', '--log-group-name-prefix', args.log_group])
         if data is not None:
             exact = [x for x in data.get('logGroups', []) if x['logGroupName'] == args.log_group]
-            check('CloudWatch 保存期間', 'PASS' if exact and exact[0].get('retentionInDays') else 'FAIL', json.dumps(exact))
+            check('CloudWatch 保存期間', 'PASS' if exact and exact[0].get('retentionInDays', 0) >= 400 else 'FAIL', json.dumps(exact))
         events = query('delivery', ['logs', 'get-log-events', '--log-group-name', args.log_group,
                                   '--log-stream-name', args.log_stream, '--limit', '1', '--no-start-from-head'])
         if events is not None:

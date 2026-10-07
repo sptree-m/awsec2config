@@ -2,14 +2,63 @@
   "logs": {
     "force_flush_interval": 5,
     "logs_collected": {
-      "windows_events": { "collect_list": [
-        { "event_name": "Security", "event_levels": ["INFORMATION", "WARNING", "ERROR", "CRITICAL", "VERBOSE"], "event_format": "xml", "log_group_name": "/ec2/security/windows/security", "log_stream_name": "{instance_id}" },
-        { "event_name": "System", "event_levels": ["INFORMATION", "WARNING", "ERROR", "CRITICAL", "VERBOSE"], "event_format": "xml", "log_group_name": "/ec2/security/windows/system", "log_stream_name": "{instance_id}" },
-        { "event_name": "Microsoft-Windows-PowerShell/Operational", "event_levels": ["INFORMATION", "WARNING", "ERROR", "CRITICAL", "VERBOSE"], "event_format": "xml", "log_group_name": "/ec2/security/windows/powershell", "log_stream_name": "{instance_id}" }
-      ] },
-      "files": { "collect_list": [
-        { "file_path": "C:\\Windows\\System32\\LogFiles\\Firewall\\pfirewall.log", "log_group_name": "/ec2/security/windows/firewall", "log_stream_name": "{instance_id}" }
-      ] }
+      "windows_events": {
+        "collect_list": [
+          {
+            "event_name": "Security",
+            "event_levels": [
+              "INFORMATION",
+              "WARNING",
+              "ERROR",
+              "CRITICAL",
+              "VERBOSE"
+            ],
+            "event_format": "xml",
+            "log_group_name": "/ec2/security/windows/security",
+            "log_stream_name": "{instance_id}"
+          },
+          {
+            "event_name": "System",
+            "event_levels": [
+              "INFORMATION",
+              "WARNING",
+              "ERROR",
+              "CRITICAL",
+              "VERBOSE"
+            ],
+            "event_format": "xml",
+            "log_group_name": "/ec2/security/windows/system",
+            "log_stream_name": "{instance_id}"
+          },
+          {
+            "event_name": "Microsoft-Windows-PowerShell/Operational",
+            "event_levels": [
+              "INFORMATION",
+              "WARNING",
+              "ERROR",
+              "CRITICAL",
+              "VERBOSE"
+            ],
+            "event_format": "xml",
+            "log_group_name": "/ec2/security/windows/powershell",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      },
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "C:\\Windows\\System32\\LogFiles\\Firewall\\pfirewall.log",
+            "log_group_name": "/ec2/security/windows/firewall",
+            "log_stream_name": "{instance_id}"
+          },
+          {
+            "file_path": "C:\\ProgramData\\awsec2config\\heartbeat.jsonl",
+            "log_group_name": "/ec2/security/heartbeat",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      }
     }
   }
 }

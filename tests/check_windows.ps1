@@ -44,4 +44,9 @@ $enabled=$header + "`n" + ('HOST,System,Logon,' + $Subcategories[0] + ',Success 
 if (-not (Audit-Enabled $enabled)) { throw 'Enabled audit policy not recognized' }
 $disabled=$header + "`n" + ('HOST,System,Logon,' + $Subcategories[0] + ',No Auditing,,0')
 if (Audit-Enabled $disabled) { throw 'Disabled audit policy incorrectly accepted' }
+foreach ($file in @(Get-ChildItem (Join-Path $PSScriptRoot '../scripts/windows') -Filter '*.ps1')) {
+    $parseTokens=$null; $parseErrors=$null
+    $null=[System.Management.Automation.Language.Parser]::ParseFile($file.FullName,[ref]$parseTokens,[ref]$parseErrors)
+    if ($parseErrors.Count) { $parseErrors | Format-List; throw ('Parse failed: '+$file.Name) }
+}
 Write-Output 'PowerShell syntax and state snapshot regressions: PASS'
