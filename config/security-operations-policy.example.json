@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "design_only_not_loaded_by_v0.1.0",
+  "status": "design_reference_not_runtime_configuration_use_deployment_example",
   "timezone": "Asia/Tokyo",
   "retention": {
     "cloudwatch_days": 400,

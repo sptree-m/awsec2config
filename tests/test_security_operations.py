@@ -319,6 +319,23 @@ class Templates(unittest.TestCase):
         self.assertFalse(any(r['Type'].startswith('AWS::IAM::') for r in stored['Resources'].values()))
         self.assertEqual(stored['Resources']['InitialMonthlySchedule']['Properties']['ScheduleExpressionTimezone'],'Asia/Tokyo')
         self.assertEqual(stored['Resources']['InitialMonthlySchedule']['Properties']['ScheduleExpression'],'cron(0 18 1 * ? *)')
+    def test_role_mutations_are_eni_scoped_and_runtime_cannot_unpause(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('role_renderer',ROOT/'scripts/aws/render_role_policies.py')
+        renderer=importlib.util.module_from_spec(spec); spec.loader.exec_module(renderer)
+        config={'region':ENV['AWS_REGION'],'account_id':ENV['ACCOUNT_ID'],'approved_eni_ids':['eni-one'],
+                'parameters':{'Prefix':'test','KmsKeyArn':ENV['KMS_KEY_ARN'],'NotificationTopicArn':ENV['NOTIFICATION_TOPIC']}}
+        result=renderer.render(config)
+        for role in ('ResponseRole','RestoreRole'):
+            statements=result[role+'.policy.json']['Statement']
+            mutation=[s for s in statements if s['Action']=='ec2:ModifyNetworkInterfaceAttribute']
+            self.assertEqual(mutation[0]['Resource'],['arn:aws:ec2:ap-northeast-1:123456789012:network-interface/eni-one'])
+        for role in ('ArchiveRole','DetectorRole','ResponseRole','RestoreRole'):
+            for statement in result[role+'.policy.json']['Statement']:
+                if 'dynamodb:PutItem' in statement['Action']:
+                    self.assertNotIn('CONTROL#*',statement['Condition']['ForAllValues:StringLike']['dynamodb:LeadingKeys'])
+        config['approved_eni_ids']=[]
+        with self.assertRaises(ValueError):renderer.render(config)
     def test_runtime_has_no_terminate_or_global_security_group_mutation(self):
         # Safety contract for the response surface, including accidental expansion in future revisions.
         import ast
