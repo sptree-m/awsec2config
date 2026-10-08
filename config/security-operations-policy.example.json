@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "status": "design_reference_not_runtime_configuration_use_deployment_example",
+  "timezone": "Asia/Tokyo",
+  "retention": {
+    "cloudwatch_days": 400,
+    "s3_object_lock_mode": "COMPLIANCE",
+    "s3_object_lock_days_from_creation": 400,
+    "s3_transition_to_glacier_flexible_after_days": 90,
+    "s3_expiration_eligible_after_days": 450,
+    "preserve_kms_until_all_protected_versions_are_unneeded": true
+  },
+  "archive": {
+    "continuous_raw_delivery": "cloudwatch_subscription_to_firehose_to_s3",
+    "raw_input": "gzip_cloudwatch_subscription_envelopes",
+    "firehose_additional_compression": "UNCOMPRESSED",
+    "preserve_event_id_log_group_log_stream_timestamp_message": true,
+    "monthly_export": {
+      "schedule": "cron(0 18 1 * ? *)",
+      "flexible_time_window": "OFF",
+      "range": "previous_calendar_month_in_Asia_Tokyo",
+      "format": "gzip_files_with_manifest",
+      "max_active_tasks_per_account_region": 1,
+      "initial_partition": "log_group_and_calendar_day",
+      "completion_deadline_day": 3,
+      "completion_deadline_hour": 18,
+      "late_arrival_reconciliation_day": 4,
+      "late_arrival_reconciliation_hour": 18,
+      "additional_late_arrivals": "daily_audit_then_publish_corrected_run",
+      "overwrite_successful_runs": false
+    }
+  },
+  "detection": {
+    "authentication_failures": { "threshold": 10, "window_minutes": 5, "action": "notify" },
+    "heartbeat_interval_minutes": 5,
+    "heartbeat_missing_after_minutes": 15,
+    "disk_free_percent_below": 10,
+    "disk_condition_duration_minutes": 10,
+    "audit_lost_above": 0,
+    "critical_notification_ack_minutes": 15,
+    "escalation_after_minutes": 30
+  },
+  "response": {
+    "mode": "auto_isolate_verified_critical_otherwise_notify",
+    "authoritative_source": "guardduty_api_reverified_finding",
+    "minimum_guardduty_severity": 7,
+    "maximum_finding_age_minutes": 30,
+    "finding_type_allowlist": [],
+    "allowlist_requirement": "primary_administrator_must_populate_before_activation",
+    "required_inventory_and_tag": "SecurityResponse=auto-isolate",
+    "change": "replace_all_supported_instance_eni_security_group_sets",
+    "isolation_groups": "precreated_per_vpc_by_primary_administrator",
+    "existing_connection_termination_guaranteed_by_sg_change": false,
+    "auto_stop_instances": false,
+    "auto_terminate_instances": false,
+    "restore_requires_human_approval": true,
+    "auto_release_after_timeout": false,
+    "permission_denied_result": "ISOLATION_BLOCKED_and_critical_notification"
+  }
+}

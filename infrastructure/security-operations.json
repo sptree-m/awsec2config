@@ -1,0 +1,2488 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "EC2 security operations v0.2: retained archives, monthly export, notifications and approved critical isolation; requires existing IAM roles",
+  "Parameters": {
+    "Prefix": {
+      "Type": "String",
+      "Default": "awsec2config",
+      "AllowedPattern": "[a-z][a-z0-9-]{2,24}"
+    },
+    "CodeBucket": {
+      "Type": "String",
+      "Description": "Existing same-region private bucket containing the release Lambda ZIP"
+    },
+    "CodeKey": {
+      "Type": "String",
+      "Description": "Versioned release lambda.zip key; use a new key for each release"
+    },
+    "KmsKeyArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:[^:]+:kms:[^:]+:[0-9]{12}:key/.+"
+    },
+    "NotificationTopicArn": {
+      "Type": "String",
+      "Description": "Existing SNS topic with confirmed primary/deputy subscribers"
+    },
+    "ArchiveRoleArn": {
+      "Type": "String"
+    },
+    "DetectorRoleArn": {
+      "Type": "String"
+    },
+    "ResponseRoleArn": {
+      "Type": "String"
+    },
+    "RestoreRoleArn": {
+      "Type": "String"
+    },
+    "LogsDeliveryRoleArn": {
+      "Type": "String"
+    },
+    "FirehoseRoleArn": {
+      "Type": "String"
+    },
+    "StateMachineRoleArn": {
+      "Type": "String"
+    },
+    "SchedulerRoleArn": {
+      "Type": "String"
+    },
+    "InstanceIds": {
+      "Type": "String",
+      "Description": "JSON array of monitored instance IDs, at most 50"
+    },
+    "IsolationGroups": {
+      "Type": "String",
+      "Description": "JSON map of VPC ID to pre-created approved isolation SG"
+    },
+    "EndpointGroupIds": {
+      "Type": "String",
+      "Description": "JSON array of approved private SSM/Logs interface endpoint SG IDs"
+    },
+    "ActiveLogGroups": {
+      "Type": "String",
+      "Default": "[\"/ec2/security/windows/security\",\"/ec2/security/windows/system\",\"/ec2/security/windows/powershell\",\"/ec2/security/windows/firewall\",\"/ec2/security/ubuntu/auth\",\"/ec2/security/ubuntu/audit\",\"/ec2/security/heartbeat\"]",
+      "Description": "JSON array of actually deployed source groups; remove unused OS groups"
+    },
+    "ExportWindowHours": {
+      "Type": "Number",
+      "Default": 24,
+      "AllowedValues": [
+        6,
+        12,
+        24
+      ]
+    },
+    "FindingTypes": {
+      "Type": "String",
+      "Description": "Required comma-separated primary-admin approved GuardDuty EC2 finding types"
+    }
+  },
+  "Resources": {
+    "ArchiveBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketName": {
+          "Fn::Sub": "${Prefix}-logs-${AWS::AccountId}-${AWS::Region}"
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "ObjectLockEnabled": true,
+        "ObjectLockConfiguration": {
+          "ObjectLockEnabled": "Enabled",
+          "Rule": {
+            "DefaultRetention": {
+              "Mode": "COMPLIANCE",
+              "Days": 400
+            }
+          }
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "OwnershipControls": {
+          "Rules": [
+            {
+              "ObjectOwnership": "BucketOwnerEnforced"
+            }
+          ]
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "aws:kms",
+                "KMSMasterKeyID": {
+                  "Ref": "KmsKeyArn"
+                }
+              },
+              "BucketKeyEnabled": true
+            }
+          ]
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "RetainAtLeast400Days",
+              "Status": "Enabled",
+              "Transitions": [
+                {
+                  "TransitionInDays": 90,
+                  "StorageClass": "GLACIER"
+                }
+              ],
+              "ExpirationInDays": 450,
+              "NoncurrentVersionTransitions": [
+                {
+                  "TransitionInDays": 90,
+                  "StorageClass": "GLACIER"
+                }
+              ],
+              "NoncurrentVersionExpiration": {
+                "NoncurrentDays": 450
+              }
+            }
+          ]
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "ArchiveBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "ArchiveBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyInsecureTransport",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "ArchiveBucket",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${ArchiveBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            },
+            {
+              "Sid": "LogsBucketAcl",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": {
+                  "Fn::Sub": "logs.${AWS::Region}.amazonaws.com"
+                }
+              },
+              "Action": "s3:GetBucketAcl",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "ArchiveBucket",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ec2/security/*"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "LogsExportWrite",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": {
+                  "Fn::Sub": "logs.${AWS::Region}.amazonaws.com"
+                }
+              },
+              "Action": "s3:PutObject",
+              "Resource": {
+                "Fn::Sub": "${ArchiveBucket.Arn}/monthly/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  },
+                  "s3:x-amz-acl": "bucket-owner-full-control"
+                },
+                "ArnLike": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ec2/security/*"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "PreventRuntimeDeletionAndLockOverride",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": [
+                "s3:DeleteObject",
+                "s3:DeleteObjectVersion",
+                "s3:PutObjectRetention",
+                "s3:BypassGovernanceRetention"
+              ],
+              "Resource": {
+                "Fn::Sub": "${ArchiveBucket.Arn}/*"
+              },
+              "Condition": {
+                "ArnEquals": {
+                  "aws:PrincipalArn": [
+                    {
+                      "Ref": "ArchiveRoleArn"
+                    },
+                    {
+                      "Ref": "DetectorRoleArn"
+                    },
+                    {
+                      "Ref": "ResponseRoleArn"
+                    },
+                    {
+                      "Ref": "RestoreRoleArn"
+                    },
+                    {
+                      "Ref": "FirehoseRoleArn"
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "StateTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": {
+          "Fn::Sub": "${Prefix}-state"
+        },
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "incident_status",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "created_epoch",
+            "AttributeType": "N"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "GlobalSecondaryIndexes": [
+          {
+            "IndexName": "open-incidents",
+            "KeySchema": [
+              {
+                "AttributeName": "incident_status",
+                "KeyType": "HASH"
+              },
+              {
+                "AttributeName": "created_epoch",
+                "KeyType": "RANGE"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "ALL"
+            }
+          }
+        ],
+        "TimeToLiveSpecification": {
+          "AttributeName": "ttl",
+          "Enabled": true
+        },
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        },
+        "SSESpecification": {
+          "SSEEnabled": true
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "WSecurityLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/ec2/security/windows/security",
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "WSystemLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/ec2/security/windows/system",
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "WPowerShellLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/ec2/security/windows/powershell",
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "WFirewallLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/ec2/security/windows/firewall",
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "UAuthLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/ec2/security/ubuntu/auth",
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "UAuditLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/ec2/security/ubuntu/audit",
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "HeartbeatLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/ec2/security/heartbeat",
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "RawDelivery": {
+      "Type": "AWS::KinesisFirehose::DeliveryStream",
+      "Properties": {
+        "DeliveryStreamName": {
+          "Fn::Sub": "${Prefix}-raw"
+        },
+        "DeliveryStreamType": "DirectPut",
+        "ExtendedS3DestinationConfiguration": {
+          "BucketARN": {
+            "Fn::GetAtt": [
+              "ArchiveBucket",
+              "Arn"
+            ]
+          },
+          "RoleARN": {
+            "Ref": "FirehoseRoleArn"
+          },
+          "Prefix": "raw/!{timestamp:yyyy/MM/dd/HH}/",
+          "ErrorOutputPrefix": "errors/!{firehose:error-output-type}/!{timestamp:yyyy/MM/dd}/",
+          "CompressionFormat": "UNCOMPRESSED",
+          "FileExtension": ".gz",
+          "BufferingHints": {
+            "IntervalInSeconds": 60,
+            "SizeInMBs": 5
+          },
+          "EncryptionConfiguration": {
+            "KMSEncryptionConfig": {
+              "AWSKMSKeyARN": {
+                "Ref": "KmsKeyArn"
+              }
+            }
+          }
+        }
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "MonthStartRuntimeLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-monthstart"
+        },
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "MonthStart": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-monthstart"
+        },
+        "Runtime": "python3.12",
+        "Handler": "archive.start",
+        "Role": {
+          "Ref": "ArchiveRoleArn"
+        },
+        "Timeout": 300,
+        "MemorySize": 1024,
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARCHIVE_BUCKET": {
+              "Ref": "ArchiveBucket"
+            },
+            "KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "STATE_TABLE": {
+              "Ref": "StateTable"
+            },
+            "NOTIFICATION_TOPIC": {
+              "Ref": "NotificationTopicArn"
+            },
+            "ACCOUNT_ID": {
+              "Ref": "AWS::AccountId"
+            },
+            "EXPORT_WINDOW_HOURS": {
+              "Ref": "ExportWindowHours"
+            },
+            "LOG_GROUPS": {
+              "Ref": "ActiveLogGroups"
+            },
+            "INSTANCE_IDS": {
+              "Ref": "InstanceIds"
+            },
+            "ISOLATION_GROUPS": {
+              "Ref": "IsolationGroups"
+            },
+            "ENDPOINT_GROUP_IDS": {
+              "Ref": "EndpointGroupIds"
+            },
+            "FINDING_TYPES": {
+              "Ref": "FindingTypes"
+            },
+            "DELIVERY_DLQ_URL": {
+              "Ref": "DeliveryDlq"
+            },
+            "FUNCTION_PURPOSE": "operations"
+          }
+        }
+      },
+      "DependsOn": [
+        "MonthStartRuntimeLog"
+      ]
+    },
+    "MonthStartErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "MonthStart failed; check security operations",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "MonthStart"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "MonthStepRuntimeLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-monthstep"
+        },
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "MonthStep": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-monthstep"
+        },
+        "Runtime": "python3.12",
+        "Handler": "archive.step",
+        "Role": {
+          "Ref": "ArchiveRoleArn"
+        },
+        "Timeout": 300,
+        "MemorySize": 1024,
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARCHIVE_BUCKET": {
+              "Ref": "ArchiveBucket"
+            },
+            "KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "STATE_TABLE": {
+              "Ref": "StateTable"
+            },
+            "NOTIFICATION_TOPIC": {
+              "Ref": "NotificationTopicArn"
+            },
+            "ACCOUNT_ID": {
+              "Ref": "AWS::AccountId"
+            },
+            "EXPORT_WINDOW_HOURS": {
+              "Ref": "ExportWindowHours"
+            },
+            "LOG_GROUPS": {
+              "Ref": "ActiveLogGroups"
+            },
+            "INSTANCE_IDS": {
+              "Ref": "InstanceIds"
+            },
+            "ISOLATION_GROUPS": {
+              "Ref": "IsolationGroups"
+            },
+            "ENDPOINT_GROUP_IDS": {
+              "Ref": "EndpointGroupIds"
+            },
+            "FINDING_TYPES": {
+              "Ref": "FindingTypes"
+            },
+            "DELIVERY_DLQ_URL": {
+              "Ref": "DeliveryDlq"
+            },
+            "FUNCTION_PURPOSE": "operations"
+          }
+        }
+      },
+      "DependsOn": [
+        "MonthStepRuntimeLog"
+      ]
+    },
+    "MonthStepErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "MonthStep failed; check security operations",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "MonthStep"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "MonthFailureRuntimeLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-monthfailure"
+        },
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "MonthFailure": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-monthfailure"
+        },
+        "Runtime": "python3.12",
+        "Handler": "archive.failure",
+        "Role": {
+          "Ref": "ArchiveRoleArn"
+        },
+        "Timeout": 300,
+        "MemorySize": 1024,
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARCHIVE_BUCKET": {
+              "Ref": "ArchiveBucket"
+            },
+            "KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "STATE_TABLE": {
+              "Ref": "StateTable"
+            },
+            "NOTIFICATION_TOPIC": {
+              "Ref": "NotificationTopicArn"
+            },
+            "ACCOUNT_ID": {
+              "Ref": "AWS::AccountId"
+            },
+            "EXPORT_WINDOW_HOURS": {
+              "Ref": "ExportWindowHours"
+            },
+            "LOG_GROUPS": {
+              "Ref": "ActiveLogGroups"
+            },
+            "INSTANCE_IDS": {
+              "Ref": "InstanceIds"
+            },
+            "ISOLATION_GROUPS": {
+              "Ref": "IsolationGroups"
+            },
+            "ENDPOINT_GROUP_IDS": {
+              "Ref": "EndpointGroupIds"
+            },
+            "FINDING_TYPES": {
+              "Ref": "FindingTypes"
+            },
+            "DELIVERY_DLQ_URL": {
+              "Ref": "DeliveryDlq"
+            },
+            "FUNCTION_PURPOSE": "operations"
+          }
+        }
+      },
+      "DependsOn": [
+        "MonthFailureRuntimeLog"
+      ]
+    },
+    "MonthFailureErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "MonthFailure failed; check security operations",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "MonthFailure"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "DetectorRuntimeLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-detector"
+        },
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Detector": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-detector"
+        },
+        "Runtime": "python3.12",
+        "Handler": "detection.handler",
+        "Role": {
+          "Ref": "DetectorRoleArn"
+        },
+        "Timeout": 300,
+        "MemorySize": 1024,
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARCHIVE_BUCKET": {
+              "Ref": "ArchiveBucket"
+            },
+            "KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "STATE_TABLE": {
+              "Ref": "StateTable"
+            },
+            "NOTIFICATION_TOPIC": {
+              "Ref": "NotificationTopicArn"
+            },
+            "ACCOUNT_ID": {
+              "Ref": "AWS::AccountId"
+            },
+            "EXPORT_WINDOW_HOURS": {
+              "Ref": "ExportWindowHours"
+            },
+            "LOG_GROUPS": {
+              "Ref": "ActiveLogGroups"
+            },
+            "INSTANCE_IDS": {
+              "Ref": "InstanceIds"
+            },
+            "ISOLATION_GROUPS": {
+              "Ref": "IsolationGroups"
+            },
+            "ENDPOINT_GROUP_IDS": {
+              "Ref": "EndpointGroupIds"
+            },
+            "FINDING_TYPES": {
+              "Ref": "FindingTypes"
+            },
+            "DELIVERY_DLQ_URL": {
+              "Ref": "DeliveryDlq"
+            },
+            "FUNCTION_PURPOSE": "operations"
+          }
+        }
+      },
+      "DependsOn": [
+        "DetectorRuntimeLog"
+      ]
+    },
+    "DetectorErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Detector failed; check security operations",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "Detector"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "AWSChangesRuntimeLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-awschanges"
+        },
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "AWSChanges": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-awschanges"
+        },
+        "Runtime": "python3.12",
+        "Handler": "detection.aws_change",
+        "Role": {
+          "Ref": "DetectorRoleArn"
+        },
+        "Timeout": 300,
+        "MemorySize": 1024,
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARCHIVE_BUCKET": {
+              "Ref": "ArchiveBucket"
+            },
+            "KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "STATE_TABLE": {
+              "Ref": "StateTable"
+            },
+            "NOTIFICATION_TOPIC": {
+              "Ref": "NotificationTopicArn"
+            },
+            "ACCOUNT_ID": {
+              "Ref": "AWS::AccountId"
+            },
+            "EXPORT_WINDOW_HOURS": {
+              "Ref": "ExportWindowHours"
+            },
+            "LOG_GROUPS": {
+              "Ref": "ActiveLogGroups"
+            },
+            "INSTANCE_IDS": {
+              "Ref": "InstanceIds"
+            },
+            "ISOLATION_GROUPS": {
+              "Ref": "IsolationGroups"
+            },
+            "ENDPOINT_GROUP_IDS": {
+              "Ref": "EndpointGroupIds"
+            },
+            "FINDING_TYPES": {
+              "Ref": "FindingTypes"
+            },
+            "DELIVERY_DLQ_URL": {
+              "Ref": "DeliveryDlq"
+            },
+            "FUNCTION_PURPOSE": "operations"
+          }
+        }
+      },
+      "DependsOn": [
+        "AWSChangesRuntimeLog"
+      ]
+    },
+    "AWSChangesErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "AWSChanges failed; check security operations",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "AWSChanges"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "ResponseRuntimeLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-response"
+        },
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Response": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-response"
+        },
+        "Runtime": "python3.12",
+        "Handler": "response.handler",
+        "Role": {
+          "Ref": "ResponseRoleArn"
+        },
+        "Timeout": 300,
+        "MemorySize": 1024,
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARCHIVE_BUCKET": {
+              "Ref": "ArchiveBucket"
+            },
+            "KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "STATE_TABLE": {
+              "Ref": "StateTable"
+            },
+            "NOTIFICATION_TOPIC": {
+              "Ref": "NotificationTopicArn"
+            },
+            "ACCOUNT_ID": {
+              "Ref": "AWS::AccountId"
+            },
+            "EXPORT_WINDOW_HOURS": {
+              "Ref": "ExportWindowHours"
+            },
+            "LOG_GROUPS": {
+              "Ref": "ActiveLogGroups"
+            },
+            "INSTANCE_IDS": {
+              "Ref": "InstanceIds"
+            },
+            "ISOLATION_GROUPS": {
+              "Ref": "IsolationGroups"
+            },
+            "ENDPOINT_GROUP_IDS": {
+              "Ref": "EndpointGroupIds"
+            },
+            "FINDING_TYPES": {
+              "Ref": "FindingTypes"
+            },
+            "DELIVERY_DLQ_URL": {
+              "Ref": "DeliveryDlq"
+            },
+            "FUNCTION_PURPOSE": "operations"
+          }
+        }
+      },
+      "DependsOn": [
+        "ResponseRuntimeLog"
+      ]
+    },
+    "ResponseErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Response failed; check security operations",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "Response"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "ResumeRuntimeLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-resume"
+        },
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Resume": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-resume"
+        },
+        "Runtime": "python3.12",
+        "Handler": "response.resume",
+        "Role": {
+          "Ref": "ResponseRoleArn"
+        },
+        "Timeout": 300,
+        "MemorySize": 1024,
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARCHIVE_BUCKET": {
+              "Ref": "ArchiveBucket"
+            },
+            "KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "STATE_TABLE": {
+              "Ref": "StateTable"
+            },
+            "NOTIFICATION_TOPIC": {
+              "Ref": "NotificationTopicArn"
+            },
+            "ACCOUNT_ID": {
+              "Ref": "AWS::AccountId"
+            },
+            "EXPORT_WINDOW_HOURS": {
+              "Ref": "ExportWindowHours"
+            },
+            "LOG_GROUPS": {
+              "Ref": "ActiveLogGroups"
+            },
+            "INSTANCE_IDS": {
+              "Ref": "InstanceIds"
+            },
+            "ISOLATION_GROUPS": {
+              "Ref": "IsolationGroups"
+            },
+            "ENDPOINT_GROUP_IDS": {
+              "Ref": "EndpointGroupIds"
+            },
+            "FINDING_TYPES": {
+              "Ref": "FindingTypes"
+            },
+            "DELIVERY_DLQ_URL": {
+              "Ref": "DeliveryDlq"
+            },
+            "FUNCTION_PURPOSE": "operations"
+          }
+        }
+      },
+      "DependsOn": [
+        "ResumeRuntimeLog"
+      ]
+    },
+    "ResumeErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Resume failed; check security operations",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "Resume"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "RestoreRuntimeLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-restore"
+        },
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Restore": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-restore"
+        },
+        "Runtime": "python3.12",
+        "Handler": "response.restore",
+        "Role": {
+          "Ref": "RestoreRoleArn"
+        },
+        "Timeout": 300,
+        "MemorySize": 1024,
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARCHIVE_BUCKET": {
+              "Ref": "ArchiveBucket"
+            },
+            "KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "STATE_TABLE": {
+              "Ref": "StateTable"
+            },
+            "NOTIFICATION_TOPIC": {
+              "Ref": "NotificationTopicArn"
+            },
+            "ACCOUNT_ID": {
+              "Ref": "AWS::AccountId"
+            },
+            "EXPORT_WINDOW_HOURS": {
+              "Ref": "ExportWindowHours"
+            },
+            "LOG_GROUPS": {
+              "Ref": "ActiveLogGroups"
+            },
+            "INSTANCE_IDS": {
+              "Ref": "InstanceIds"
+            },
+            "ISOLATION_GROUPS": {
+              "Ref": "IsolationGroups"
+            },
+            "ENDPOINT_GROUP_IDS": {
+              "Ref": "EndpointGroupIds"
+            },
+            "FINDING_TYPES": {
+              "Ref": "FindingTypes"
+            },
+            "DELIVERY_DLQ_URL": {
+              "Ref": "DeliveryDlq"
+            },
+            "FUNCTION_PURPOSE": "restore"
+          }
+        }
+      },
+      "DependsOn": [
+        "RestoreRuntimeLog"
+      ]
+    },
+    "RestoreErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Restore failed; check security operations",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "Restore"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "OperationsRuntimeLog": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${Prefix}-operations"
+        },
+        "RetentionInDays": 400
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "Operations": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${Prefix}-operations"
+        },
+        "Runtime": "python3.12",
+        "Handler": "operations.handler",
+        "Role": {
+          "Ref": "DetectorRoleArn"
+        },
+        "Timeout": 300,
+        "MemorySize": 1024,
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          }
+        },
+        "Environment": {
+          "Variables": {
+            "ARCHIVE_BUCKET": {
+              "Ref": "ArchiveBucket"
+            },
+            "KMS_KEY_ARN": {
+              "Ref": "KmsKeyArn"
+            },
+            "STATE_TABLE": {
+              "Ref": "StateTable"
+            },
+            "NOTIFICATION_TOPIC": {
+              "Ref": "NotificationTopicArn"
+            },
+            "ACCOUNT_ID": {
+              "Ref": "AWS::AccountId"
+            },
+            "EXPORT_WINDOW_HOURS": {
+              "Ref": "ExportWindowHours"
+            },
+            "LOG_GROUPS": {
+              "Ref": "ActiveLogGroups"
+            },
+            "INSTANCE_IDS": {
+              "Ref": "InstanceIds"
+            },
+            "ISOLATION_GROUPS": {
+              "Ref": "IsolationGroups"
+            },
+            "ENDPOINT_GROUP_IDS": {
+              "Ref": "EndpointGroupIds"
+            },
+            "FINDING_TYPES": {
+              "Ref": "FindingTypes"
+            },
+            "DELIVERY_DLQ_URL": {
+              "Ref": "DeliveryDlq"
+            },
+            "FUNCTION_PURPOSE": "operations"
+          }
+        }
+      },
+      "DependsOn": [
+        "OperationsRuntimeLog"
+      ]
+    },
+    "OperationsErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Operations failed; check security operations",
+        "Namespace": "AWS/Lambda",
+        "MetricName": "Errors",
+        "Dimensions": [
+          {
+            "Name": "FunctionName",
+            "Value": {
+              "Ref": "Operations"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "DetectorPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "Detector"
+        },
+        "Principal": {
+          "Fn::Sub": "logs.${AWS::Region}.amazonaws.com"
+        },
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ec2/security/*"
+        }
+      }
+    },
+    "WSecurityRawSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "WSecurityLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "RawDelivery",
+            "Arn"
+          ]
+        },
+        "RoleArn": {
+          "Ref": "LogsDeliveryRoleArn"
+        }
+      }
+    },
+    "WSecurityDetectionSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "WSecurityLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "Detector",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "DetectorPermission"
+      ]
+    },
+    "WSecurityDeliveryErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Logs",
+        "MetricName": "DeliveryErrors",
+        "Dimensions": [
+          {
+            "Name": "LogGroupName",
+            "Value": {
+              "Ref": "WSecurityLogGroup"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "WSystemRawSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "WSystemLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "RawDelivery",
+            "Arn"
+          ]
+        },
+        "RoleArn": {
+          "Ref": "LogsDeliveryRoleArn"
+        }
+      }
+    },
+    "WSystemDetectionSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "WSystemLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "Detector",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "DetectorPermission"
+      ]
+    },
+    "WSystemDeliveryErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Logs",
+        "MetricName": "DeliveryErrors",
+        "Dimensions": [
+          {
+            "Name": "LogGroupName",
+            "Value": {
+              "Ref": "WSystemLogGroup"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "WPowerShellRawSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "WPowerShellLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "RawDelivery",
+            "Arn"
+          ]
+        },
+        "RoleArn": {
+          "Ref": "LogsDeliveryRoleArn"
+        }
+      }
+    },
+    "WPowerShellDetectionSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "WPowerShellLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "Detector",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "DetectorPermission"
+      ]
+    },
+    "WPowerShellDeliveryErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Logs",
+        "MetricName": "DeliveryErrors",
+        "Dimensions": [
+          {
+            "Name": "LogGroupName",
+            "Value": {
+              "Ref": "WPowerShellLogGroup"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "WFirewallRawSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "WFirewallLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "RawDelivery",
+            "Arn"
+          ]
+        },
+        "RoleArn": {
+          "Ref": "LogsDeliveryRoleArn"
+        }
+      }
+    },
+    "WFirewallDetectionSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "WFirewallLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "Detector",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "DetectorPermission"
+      ]
+    },
+    "WFirewallDeliveryErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Logs",
+        "MetricName": "DeliveryErrors",
+        "Dimensions": [
+          {
+            "Name": "LogGroupName",
+            "Value": {
+              "Ref": "WFirewallLogGroup"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "UAuthRawSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "UAuthLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "RawDelivery",
+            "Arn"
+          ]
+        },
+        "RoleArn": {
+          "Ref": "LogsDeliveryRoleArn"
+        }
+      }
+    },
+    "UAuthDetectionSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "UAuthLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "Detector",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "DetectorPermission"
+      ]
+    },
+    "UAuthDeliveryErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Logs",
+        "MetricName": "DeliveryErrors",
+        "Dimensions": [
+          {
+            "Name": "LogGroupName",
+            "Value": {
+              "Ref": "UAuthLogGroup"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "UAuditRawSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "UAuditLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "RawDelivery",
+            "Arn"
+          ]
+        },
+        "RoleArn": {
+          "Ref": "LogsDeliveryRoleArn"
+        }
+      }
+    },
+    "UAuditDetectionSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "UAuditLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "Detector",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "DetectorPermission"
+      ]
+    },
+    "UAuditDeliveryErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Logs",
+        "MetricName": "DeliveryErrors",
+        "Dimensions": [
+          {
+            "Name": "LogGroupName",
+            "Value": {
+              "Ref": "UAuditLogGroup"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "HeartbeatRawSubscription": {
+      "Type": "AWS::Logs::SubscriptionFilter",
+      "Properties": {
+        "LogGroupName": {
+          "Ref": "HeartbeatLogGroup"
+        },
+        "FilterPattern": "",
+        "DestinationArn": {
+          "Fn::GetAtt": [
+            "RawDelivery",
+            "Arn"
+          ]
+        },
+        "RoleArn": {
+          "Ref": "LogsDeliveryRoleArn"
+        }
+      }
+    },
+    "HeartbeatDeliveryErrorAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Logs",
+        "MetricName": "DeliveryErrors",
+        "Dimensions": [
+          {
+            "Name": "LogGroupName",
+            "Value": {
+              "Ref": "HeartbeatLogGroup"
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "RawFreshnessAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/Firehose",
+        "MetricName": "DeliveryToS3.DataFreshness",
+        "Dimensions": [
+          {
+            "Name": "DeliveryStreamName",
+            "Value": {
+              "Ref": "RawDelivery"
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 300,
+        "EvaluationPeriods": 1,
+        "Threshold": 900,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "MonthlyWorkflow": {
+      "Type": "AWS::StepFunctions::StateMachine",
+      "Properties": {
+        "StateMachineName": {
+          "Fn::Sub": "${Prefix}-monthly"
+        },
+        "StateMachineType": "STANDARD",
+        "RoleArn": {
+          "Ref": "StateMachineRoleArn"
+        },
+        "Definition": {
+          "StartAt": "Initialize",
+          "TimeoutSeconds": 172800,
+          "States": {
+            "Initialize": {
+              "Type": "Task",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "MonthStart",
+                  "Arn"
+                ]
+              },
+              "Next": "StartChoice",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.failure",
+                  "Next": "RecordFailure"
+                }
+              ],
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ]
+            },
+            "StartChoice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.phase",
+                  "StringEquals": "WAIT_START",
+                  "Next": "WaitStart"
+                },
+                {
+                  "Variable": "$.phase",
+                  "StringEquals": "DONE",
+                  "Next": "Complete"
+                }
+              ],
+              "Default": "Advance"
+            },
+            "WaitStart": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "Reinitialize"
+            },
+            "Reinitialize": {
+              "Type": "Task",
+              "InputPath": "$.request",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "MonthStart",
+                  "Arn"
+                ]
+              },
+              "Next": "StartChoice",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.failure",
+                  "Next": "RecordFailure"
+                }
+              ],
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ]
+            },
+            "Advance": {
+              "Type": "Task",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "MonthStep",
+                  "Arn"
+                ]
+              },
+              "Next": "StepChoice",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.failure",
+                  "Next": "RecordFailure"
+                }
+              ],
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ]
+            },
+            "StepChoice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.phase",
+                  "StringEquals": "DONE",
+                  "Next": "Complete"
+                },
+                {
+                  "Variable": "$.phase",
+                  "StringEquals": "NEXT",
+                  "Next": "Advance"
+                }
+              ],
+              "Default": "Wait"
+            },
+            "Wait": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "Advance"
+            },
+            "RecordFailure": {
+              "Type": "Task",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "MonthFailure",
+                  "Arn"
+                ]
+              },
+              "Next": "Failed"
+            },
+            "Failed": {
+              "Type": "Fail",
+              "Error": "MonthlyExportFailed"
+            },
+            "Complete": {
+              "Type": "Succeed"
+            }
+          }
+        }
+      }
+    },
+    "InitialMonthlySchedule": {
+      "Type": "AWS::Scheduler::Schedule",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Prefix}-monthly-initial"
+        },
+        "ScheduleExpression": "cron(0 18 1 * ? *)",
+        "ScheduleExpressionTimezone": "Asia/Tokyo",
+        "FlexibleTimeWindow": {
+          "Mode": "OFF"
+        },
+        "Target": {
+          "Arn": {
+            "Fn::GetAtt": [
+              "MonthlyWorkflow",
+              "Arn"
+            ]
+          },
+          "RoleArn": {
+            "Ref": "SchedulerRoleArn"
+          },
+          "Input": "{\"revision\": \"initial\", \"scheduled_time\": \"<aws.scheduler.scheduled-time>\"}",
+          "DeadLetterConfig": {
+            "Arn": {
+              "Fn::GetAtt": [
+                "DeliveryDlq",
+                "Arn"
+              ]
+            }
+          },
+          "RetryPolicy": {
+            "MaximumRetryAttempts": 5,
+            "MaximumEventAgeInSeconds": 86400
+          }
+        }
+      }
+    },
+    "CorrectionMonthlySchedule": {
+      "Type": "AWS::Scheduler::Schedule",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Prefix}-monthly-correction"
+        },
+        "ScheduleExpression": "cron(0 18 4 * ? *)",
+        "ScheduleExpressionTimezone": "Asia/Tokyo",
+        "FlexibleTimeWindow": {
+          "Mode": "OFF"
+        },
+        "Target": {
+          "Arn": {
+            "Fn::GetAtt": [
+              "MonthlyWorkflow",
+              "Arn"
+            ]
+          },
+          "RoleArn": {
+            "Ref": "SchedulerRoleArn"
+          },
+          "Input": "{\"revision\": \"correction\", \"scheduled_time\": \"<aws.scheduler.scheduled-time>\"}",
+          "DeadLetterConfig": {
+            "Arn": {
+              "Fn::GetAtt": [
+                "DeliveryDlq",
+                "Arn"
+              ]
+            }
+          },
+          "RetryPolicy": {
+            "MaximumRetryAttempts": 5,
+            "MaximumEventAgeInSeconds": 86400
+          }
+        }
+      }
+    },
+    "OperationsSchedule": {
+      "Type": "AWS::Scheduler::Schedule",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Prefix}-operations"
+        },
+        "ScheduleExpression": "rate(5 minutes)",
+        "FlexibleTimeWindow": {
+          "Mode": "OFF"
+        },
+        "Target": {
+          "Arn": {
+            "Fn::GetAtt": [
+              "Operations",
+              "Arn"
+            ]
+          },
+          "RoleArn": {
+            "Ref": "SchedulerRoleArn"
+          },
+          "Input": "{}",
+          "DeadLetterConfig": {
+            "Arn": {
+              "Fn::GetAtt": [
+                "DeliveryDlq",
+                "Arn"
+              ]
+            }
+          },
+          "RetryPolicy": {
+            "MaximumRetryAttempts": 2,
+            "MaximumEventAgeInSeconds": 600
+          }
+        }
+      }
+    },
+    "DeliveryDlq": {
+      "Type": "AWS::SQS::Queue",
+      "Properties": {
+        "QueueName": {
+          "Fn::Sub": "${Prefix}-delivery-dlq"
+        },
+        "MessageRetentionPeriod": 1209600,
+        "SqsManagedSseEnabled": true
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "DlqAlarm": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "Namespace": "AWS/SQS",
+        "MetricName": "ApproximateNumberOfMessagesVisible",
+        "Dimensions": [
+          {
+            "Name": "QueueName",
+            "Value": {
+              "Fn::GetAtt": [
+                "DeliveryDlq",
+                "QueueName"
+              ]
+            }
+          }
+        ],
+        "Statistic": "Maximum",
+        "Period": 60,
+        "EvaluationPeriods": 1,
+        "Threshold": 1,
+        "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+        "TreatMissingData": "notBreaching",
+        "AlarmActions": [
+          {
+            "Ref": "NotificationTopicArn"
+          }
+        ]
+      }
+    },
+    "GuardDutyRule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Prefix}-guardduty"
+        },
+        "EventPattern": {
+          "source": [
+            "aws.guardduty"
+          ],
+          "detail-type": [
+            "GuardDuty Finding"
+          ],
+          "account": [
+            {
+              "Ref": "AWS::AccountId"
+            }
+          ]
+        },
+        "Targets": [
+          {
+            "Id": "CriticalResponse",
+            "Arn": {
+              "Fn::GetAtt": [
+                "Response",
+                "Arn"
+              ]
+            },
+            "DeadLetterConfig": {
+              "Arn": {
+                "Fn::GetAtt": [
+                  "DeliveryDlq",
+                  "Arn"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "ResponseAsyncFailure": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Response"
+        },
+        "Qualifier": "$LATEST",
+        "MaximumEventAgeInSeconds": 600,
+        "MaximumRetryAttempts": 2,
+        "DestinationConfig": {
+          "OnFailure": {
+            "Destination": {
+              "Fn::GetAtt": [
+                "DeliveryDlq",
+                "Arn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "DetectorAsyncFailure": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Detector"
+        },
+        "Qualifier": "$LATEST",
+        "MaximumEventAgeInSeconds": 600,
+        "MaximumRetryAttempts": 2,
+        "DestinationConfig": {
+          "OnFailure": {
+            "Destination": {
+              "Fn::GetAtt": [
+                "DeliveryDlq",
+                "Arn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "AWSChangesAsyncFailure": {
+      "Type": "AWS::Lambda::EventInvokeConfig",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "AWSChanges"
+        },
+        "Qualifier": "$LATEST",
+        "MaximumEventAgeInSeconds": 600,
+        "MaximumRetryAttempts": 2,
+        "DestinationConfig": {
+          "OnFailure": {
+            "Destination": {
+              "Fn::GetAtt": [
+                "DeliveryDlq",
+                "Arn"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "DlqPolicy": {
+      "Type": "AWS::SQS::QueuePolicy",
+      "Properties": {
+        "Queues": [
+          {
+            "Ref": "DeliveryDlq"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "events.amazonaws.com"
+              },
+              "Action": "sqs:SendMessage",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "DeliveryDlq",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "ArnEquals": {
+                  "aws:SourceArn": [
+                    {
+                      "Fn::GetAtt": [
+                        "GuardDutyRule",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "AWSChangeRule",
+                        "Arn"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "AWSChangeRule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Prefix}-aws-changes"
+        },
+        "EventPattern": {
+          "source": [
+            "aws.cloudtrail",
+            "aws.kms",
+            "aws.logs",
+            "aws.s3",
+            "aws.ec2"
+          ],
+          "detail-type": [
+            "AWS API Call via CloudTrail"
+          ],
+          "account": [
+            {
+              "Ref": "AWS::AccountId"
+            }
+          ],
+          "detail": {
+            "eventName": [
+              "StopLogging",
+              "DeleteTrail",
+              "UpdateTrail",
+              "DisableKey",
+              "ScheduleKeyDeletion",
+              "DeleteLogGroup",
+              "PutRetentionPolicy",
+              "PutBucketVersioning",
+              "PutObjectLockConfiguration",
+              "PutBucketLifecycle",
+              "PutBucketLifecycleConfiguration",
+              "AuthorizeSecurityGroupIngress"
+            ]
+          }
+        },
+        "Targets": [
+          {
+            "Id": "NotifyChanges",
+            "Arn": {
+              "Fn::GetAtt": [
+                "AWSChanges",
+                "Arn"
+              ]
+            },
+            "DeadLetterConfig": {
+              "Arn": {
+                "Fn::GetAtt": [
+                  "DeliveryDlq",
+                  "Arn"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "AWSChangesPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "AWSChanges"
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "AWSChangeRule",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "GuardDutyPermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "Response"
+        },
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "GuardDutyRule",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "WorkflowFailureRule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${Prefix}-workflow-failure"
+        },
+        "EventPattern": {
+          "source": [
+            "aws.states"
+          ],
+          "detail-type": [
+            "Step Functions Execution Status Change"
+          ],
+          "detail": {
+            "stateMachineArn": [
+              {
+                "Fn::GetAtt": [
+                  "MonthlyWorkflow",
+                  "Arn"
+                ]
+              }
+            ],
+            "status": [
+              "FAILED",
+              "TIMED_OUT",
+              "ABORTED"
+            ]
+          }
+        },
+        "Targets": [
+          {
+            "Id": "NotifyFailure",
+            "Arn": {
+              "Ref": "NotificationTopicArn"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "ArchiveBucket": {
+      "Value": {
+        "Ref": "ArchiveBucket"
+      }
+    },
+    "StateTable": {
+      "Value": {
+        "Ref": "StateTable"
+      }
+    },
+    "MonthlyWorkflowArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "MonthlyWorkflow",
+          "Arn"
+        ]
+      }
+    },
+    "RestoreFunction": {
+      "Value": {
+        "Ref": "Restore"
+      }
+    },
+    "ResponseFunction": {
+      "Value": {
+        "Ref": "Response"
+      }
+    },
+    "ResumeFunction": {
+      "Value": {
+        "Ref": "Resume"
+      }
+    },
+    "OperationsFunction": {
+      "Value": {
+        "Ref": "Operations"
+      }
+    }
+  }
+}

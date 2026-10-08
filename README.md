@@ -8,7 +8,13 @@ EC2 の Windows Server 2025 と Ubuntu 22.04 / 24.04 LTS 向けのログ収集�
 | 導入監査／日次運用 | `audit` / `daily` | `-Mode Audit` / `-Mode Daily` |
 | 復元 | `restore`（プレビュー）、`restore --execute` | `-Mode Restore`（プレビュー）、`-Mode Restore -Execute` |
 
-ログ収集のベースラインであり、OS 全体の安全保証や侵害なしの証明ではありません。接続許可、アカウント、IAM、CloudTrail は自動変更しません。AWS リソースの作成・削除 API は呼びません。
+ログ収集のベースラインであり、OS 全体の安全保証や侵害なしの証明ではありません。接続許可、アカウント、IAM、CloudTrail は自動変更しません。OS スクリプトは AWS リソースを変更しません。v0.2.0 の AWS 導入ツールは、変更セットを作成し、明示実行時に専用リソースを導入します。IAM ロールや既存の接続用 SG は正管理者が用意します。
+
+## v0.2.0 の中央運用
+
+CloudWatch 400日保存、S3 COMPLIANCE 400日保存、毎月1日18:00 JSTの前月 gzip 出力、4日の補正出力、SNS通知、重大 GuardDuty 検知の承認済み EC2 隔離を実装しました。[導入・通知・隔離・復旧手順](docs/security-operations.md)を確認してください。全ソース・手順・テストと Lambda 配布 ZIP は [Releases](https://github.com/sptree-m/awsec2config/releases) からダウンロードできます。
+
+[設計書](docs/security-operations-design.md)は計画時の資料です。実装範囲・制約は上記の運用手順を優先します。
 
 ## はじめに
 
@@ -74,6 +80,7 @@ report.html（一覧）、report.json（コマンド・取得結果）、sha256.
 ## 検証
 
 ```bash
+python3 -m pip install -r requirements-dev.txt
 python3 -m unittest discover -s tests -v
 ```
 

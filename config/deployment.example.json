@@ -1,0 +1,29 @@
+{
+  "profile": "deputy",
+  "region": "ap-northeast-1",
+  "account_id": "REPLACE_ACCOUNT_ID",
+  "stack_name": "awsec2config-security",
+  "parameters": {
+    "Prefix": "awsec2config",
+    "CodeBucket": "REPLACE_EXISTING_CODE_BUCKET",
+    "CodeKey": "releases/v0.2.0/awsec2config-v0.2.0-lambda.zip",
+    "KmsKeyArn": "REPLACE_EXISTING_KMS_KEY_ARN",
+    "NotificationTopicArn": "REPLACE_EXISTING_CONFIRMED_SNS_TOPIC_ARN",
+    "ArchiveRoleArn": "REPLACE_ARCHIVE_ROLE_ARN",
+    "DetectorRoleArn": "REPLACE_DETECTOR_ROLE_ARN",
+    "ResponseRoleArn": "REPLACE_RESPONSE_ROLE_ARN",
+    "RestoreRoleArn": "REPLACE_HUMAN_RESTORE_EXECUTION_ROLE_ARN",
+    "LogsDeliveryRoleArn": "REPLACE_LOGS_SERVICE_ROLE_ARN",
+    "FirehoseRoleArn": "REPLACE_FIREHOSE_ROLE_ARN",
+    "StateMachineRoleArn": "REPLACE_STEP_FUNCTIONS_ROLE_ARN",
+    "SchedulerRoleArn": "REPLACE_SCHEDULER_ROLE_ARN",
+    "InstanceIds": "[\"i-0123456789abcdef0\"]",
+    "IsolationGroups": "{\"vpc-REPLACE\":\"sg-REPLACE\"}",
+    "FindingTypes": "REPLACE_PRIMARY_ADMIN_APPROVED_FINDING_TYPES",
+    "EndpointGroupIds": "[\"sg-REPLACE\"]",
+    "ActiveLogGroups": "[\"/ec2/security/windows/security\", \"/ec2/security/windows/system\", \"/ec2/security/windows/powershell\", \"/ec2/security/windows/firewall\", \"/ec2/security/ubuntu/auth\", \"/ec2/security/ubuntu/audit\", \"/ec2/security/heartbeat\"]"
+  },
+  "approved_eni_ids": [
+    "eni-REPLACE"
+  ]
+}

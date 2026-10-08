@@ -3,3 +3,6 @@ __pycache__/
 reports/
 state/
 *.evtx
+dist/
+.deployment/
+config/deployment.local.json
